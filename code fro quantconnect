@@ -1,0 +1,325 @@
+from AlgorithmImports import *
+import numpy as np
+from datetime import timedelta
+
+
+class VixRegime:
+	LOW			= "LOW"
+	NORMAL		= "NORMAL"
+	ELEVATED	= "ELEVATED"
+	CRISIS		= "CRISIS"
+
+
+class PrometheusVixRiskProfile:
+
+	REGIME_SCALARS = {
+		VixRegime.LOW:		1.00,
+		VixRegime.NORMAL:	0.80,
+		VixRegime.ELEVATED:	0.50,
+		VixRegime.CRISIS:	0.25,
+	}
+
+	def __init__(self, lookback: int = 60, beta_clip: float = 2.0):
+		self.lookback		= lookback
+		self.beta_clip		= beta_clip
+		self.vix_returns	= np.array([])
+		self.current_vix	= 20.0
+		self.asset_vix_beta	= {}
+		self.regime			= VixRegime.NORMAL
+
+	def update_vix(self, vix_closes: np.ndarray) -> None:
+		if len(vix_closes) < 3:
+			return
+		self.current_vix	= float(vix_closes[-1])
+		self.vix_returns	= np.diff(vix_closes) / np.maximum(vix_closes[:-1], 1e-6)
+		self.regime			= self._classify(self.current_vix)
+
+	def update_asset_beta(self, symbol, asset_returns: np.ndarray) -> None:
+		n = min(len(asset_returns), len(self.vix_returns), self.lookback)
+		if n < 10:
+			return
+		a	= asset_returns[-n:]
+		v	= self.vix_returns[-n:]
+		cov	= np.cov(a, v)
+		var	= cov[1, 1]
+		if var < 1e-10:
+			return
+		self.asset_vix_beta[symbol] = float(np.clip(cov[0, 1] / var, -self.beta_clip, self.beta_clip))
+
+	def get_scalar(self, symbol) -> float:
+		beta			= self.asset_vix_beta.get(symbol, 0.0)
+		regime_scalar	= self.REGIME_SCALARS[self.regime]
+		if beta >= 0:
+			beta_scalar = max(0.10, 1.0 - (beta / self.beta_clip))
+		else:
+			beta_scalar = min(1.0, 1.0 + abs(beta) * 0.25)
+		return float(np.clip(beta_scalar * regime_scalar, 0.05, 1.0))
+
+	@staticmethod
+	def _classify(vix: float) -> str:
+		if vix < 15:
+			return VixRegime.LOW
+		elif vix < 25:
+			return VixRegime.NORMAL
+		elif vix < 35:
+			return VixRegime.ELEVATED
+		return VixRegime.CRISIS
+
+
+class PrometheusRiskModel(RiskManagementModel):
+
+	FOREX_MIN_NOTIONAL = 2000.0
+
+	def __init__(
+		self,
+		max_drawdown:		float = 0.20,
+		max_position_pct:	float = 0.20,
+		vol_target:			float = 0.02,
+		correlation_limit:	float = 0.85,
+		vol_lookback:		int   = 30,
+		vix_profile:		PrometheusVixRiskProfile = None,
+	):
+		self.max_drawdown		= max_drawdown
+		self.max_position_pct	= max_position_pct
+		self.vol_target			= vol_target
+		self.correlation_limit	= correlation_limit
+		self.vol_lookback		= vol_lookback
+		self.vix_profile		= vix_profile if vix_profile else PrometheusVixRiskProfile()
+		self.portfolio_peak		= 0.0
+		self.asset_vols			= {}
+		self.asset_returns		= {}
+
+	def ManageRisk(self, algorithm: QCAlgorithm, targets: list) -> list:
+		pv = algorithm.Portfolio.TotalPortfolioValue
+		if pv <= 0:
+			return []
+
+		self.portfolio_peak = max(self.portfolio_peak, pv)
+		drawdown = (pv - self.portfolio_peak) / self.portfolio_peak
+
+		if drawdown < -self.max_drawdown:
+			algorithm.Log(f"[PROMETHEUS] DRAWDOWN {drawdown:.2%} — LIQUIDATING")
+			algorithm.Liquidate()
+			return []
+
+		active = [
+			t for t in targets
+			if t.Symbol in algorithm.Securities
+			and algorithm.Securities[t.Symbol].Price > 0
+		]
+
+		correlated	= self._correlated_symbols(active)
+		adjusted	= []
+
+		for t in active:
+			sym		= t.Symbol
+			sec		= algorithm.Securities[sym]
+			price	= sec.Price
+			is_forex = sec.Type == SecurityType.Forex
+
+			vol		= self.asset_vols.get(sym, self.vol_target)
+			vol_scale	= self.vol_target / max(vol, 1e-6)
+			vix_scale	= self.vix_profile.get_scalar(sym)
+			corr_scale	= 0.5 if sym in correlated else 1.0
+
+			scale		= vol_scale * vix_scale * corr_scale
+			max_qty		= (self.max_position_pct * pv) / price
+			raw_qty		= t.Quantity * scale
+			final_qty	= int(np.sign(raw_qty) * min(abs(raw_qty), max_qty))
+
+			if is_forex:
+				min_qty = int(self.FOREX_MIN_NOTIONAL / price) + 1
+				if abs(final_qty) < min_qty:
+					continue
+
+			if final_qty != 0:
+				adjusted.append(PortfolioTarget(sym, final_qty))
+
+		return adjusted
+
+	def _correlated_symbols(self, targets: list) -> set:
+		out		= set()
+		syms	= [t.Symbol for t in targets if t.Symbol in self.asset_returns]
+		if len(syms) < 2:
+			return out
+		matrix	= [self.asset_returns[s][-self.vol_lookback:] for s in syms]
+		min_len	= min(len(r) for r in matrix)
+		if min_len < 2:
+			return out
+		matrix	= np.array([r[-min_len:] for r in matrix])
+		corr	= np.corrcoef(matrix)
+		for i in range(len(syms)):
+			for j in range(i + 1, len(syms)):
+				if corr[i, j] > self.correlation_limit:
+					out.add(syms[j])
+		return out
+
+	def update_asset_data(self, symbol, returns: np.ndarray) -> None:
+		if len(returns) < 2:
+			return
+		window						= returns[-self.vol_lookback:]
+		self.asset_vols[symbol]		= float(np.std(window))
+		self.asset_returns[symbol]	= window
+		self.vix_profile.update_asset_beta(symbol, returns)
+
+
+class PrometheusFundAllocator(QCAlgorithm):
+
+	EQUITY_UNIVERSE	= ["SPY", "QQQ", "TLT", "GLD", "IWM", "EEM", "XLF", "XLE"]
+	FAST_PERIOD		= 50
+	SLOW_PERIOD		= 200
+	REBALANCE_DAYS	= 7
+	ALERT_THRESHOLD	= 0.15
+
+	def Initialize(self) -> None:
+		self.SetStartDate(2018, 1, 1)
+		self.SetEndDate(2023, 12, 31)
+		self.SetCash(1_000_000)
+
+		self.symbols = []
+
+		for ticker in self.EQUITY_UNIVERSE:
+			eq = self.AddEquity(ticker, Resolution.Daily)
+			eq.SetLeverage(1.0)
+			self.symbols.append(eq.Symbol)
+
+		self.vix_symbol = self.AddIndex("VIX", Resolution.Daily).Symbol
+
+		self.fast_sma = {s: self.SMA(s, self.FAST_PERIOD, Resolution.Daily) for s in self.symbols}
+		self.slow_sma = {s: self.SMA(s, self.SLOW_PERIOD, Resolution.Daily) for s in self.symbols}
+
+		self.risk_model = PrometheusRiskModel(
+			max_drawdown		= 0.20,
+			max_position_pct	= 0.20,
+			vol_target			= 0.02,
+			correlation_limit	= 0.85,
+			vol_lookback		= 30,
+			vix_profile			= PrometheusVixRiskProfile(lookback=60, beta_clip=2.0),
+		)
+
+		self.SetRiskManagement(self.risk_model)
+		self.SetWarmUp(self.SLOW_PERIOD + 10, Resolution.Daily)
+
+		self.next_rebalance	= self.StartDate
+		self._alert_sent	= False
+
+	def OnData(self, data: Slice) -> None:
+		if self.IsWarmingUp:
+			return
+
+		self._refresh_vix()
+		self._refresh_vols()
+
+		if self.Time < self.next_rebalance:
+			return
+
+		self._rebalance(data)
+		self.next_rebalance = self.Time + timedelta(days=self.REBALANCE_DAYS)
+
+	def _refresh_vix(self) -> None:
+		hist = self.History(self.vix_symbol, self.risk_model.vix_profile.lookback + 2, Resolution.Daily)
+		if hist.empty or len(hist) < 5:
+			return
+		try:
+			closes = hist["close"].unstack(level=0).squeeze().values.astype(float)
+			self.risk_model.vix_profile.update_vix(closes)
+		except Exception:
+			pass
+
+	def _refresh_vols(self) -> None:
+		lookback = self.risk_model.vix_profile.lookback + 2
+		for sym in self.symbols:
+			hist = self.History(sym, lookback, Resolution.Daily)
+			if hist.empty or len(hist) < 3:
+				continue
+			try:
+				closes	= hist["close"].unstack(level=0).squeeze()
+				returns	= closes.pct_change().dropna().values
+				self.risk_model.update_asset_data(sym, returns)
+			except Exception:
+				pass
+
+	def _rebalance(self, data: Slice) -> None:
+		signals = {}
+		for sym in self.symbols:
+			if not self.fast_sma[sym].IsReady or not self.slow_sma[sym].IsReady:
+				continue
+			if sym not in data or data[sym] is None:
+				continue
+			signals[sym] = 1 if self.fast_sma[sym].Current.Value > self.slow_sma[sym].Current.Value else 0
+
+		active = [s for s, sig in signals.items() if sig == 1]
+
+		if not active:
+			self.Liquidate()
+			return
+
+		weights	= self._erc_weights(active)
+		pv		= self.Portfolio.TotalPortfolioValue
+
+		for sym in self.symbols:
+			if sym not in active and self.Portfolio[sym].Invested:
+				self.Liquidate(sym)
+
+		for sym in active:
+			price = self.Securities[sym].Price
+			if price <= 0:
+				continue
+
+			vol			= self.risk_model.asset_vols.get(sym, self.risk_model.vol_target)
+			vol_scale	= self.risk_model.vol_target / max(vol, 1e-6)
+			vix_scale	= self.risk_model.vix_profile.get_scalar(sym)
+			combined	= vol_scale * vix_scale
+
+			weight		= weights.get(sym, 0.0) * combined
+			weight		= min(weight, self.risk_model.max_position_pct)
+
+			target_value	= weight * pv
+			target_qty		= int(target_value / price)
+			current_qty		= self.Portfolio[sym].Quantity
+			delta			= target_qty - current_qty
+
+			if abs(delta) > 0:
+				self.MarketOrder(sym, delta)
+
+	def _erc_weights(self, symbols: list) -> dict:
+		vols		= np.array([max(self.risk_model.asset_vols.get(s, self.risk_model.vol_target), 1e-6) for s in symbols])
+		inv_vols	= 1.0 / vols
+		weights		= inv_vols / inv_vols.sum()
+		return {s: float(w) for s, w in zip(symbols, weights)}
+
+	def OnEndOfDay(self, symbol) -> None:
+		if symbol != self.symbols[0]:
+			return
+
+		pv		= self.Portfolio.TotalPortfolioValue
+		peak	= self.risk_model.portfolio_peak
+		dd		= (pv - peak) / peak if peak > 0 else 0.0
+		vix		= self.risk_model.vix_profile.current_vix
+		regime	= self.risk_model.vix_profile.regime
+
+		self.Plot("Prometheus | Fund",	"Portfolio Value",			pv)
+		self.Plot("Prometheus | Risk",	"Drawdown %",				round(dd * 100, 4))
+		self.Plot("Prometheus | VIX",	"VIX Level",				round(vix, 2))
+		self.Plot("Prometheus | VIX",	"Regime (1=Low 4=Crisis)",	{
+			VixRegime.LOW: 1, VixRegime.NORMAL: 2,
+			VixRegime.ELEVATED: 3, VixRegime.CRISIS: 4
+		}.get(regime, 2))
+
+		avg_vol = [v for v in self.risk_model.asset_vols.values() if v > 0]
+		if avg_vol:
+			self.Plot("Prometheus | Risk", "Avg Asset Vol", round(float(np.mean(avg_vol)), 6))
+
+		if dd < -self.ALERT_THRESHOLD and not self._alert_sent:
+			self.Log(f"[TAIL ALERT] Drawdown {dd:.2%} | VIX={vix:.1f} | Regime={regime}")
+			self._alert_sent = True
+
+		if dd > -0.05:
+			self._alert_sent = False
+
+	def OnSecuritiesChanged(self, changes: SecurityChanges) -> None:
+		for sec in changes.RemovedSecurities:
+			sym = sec.Symbol
+			self.risk_model.asset_vols.pop(sym, None)
+			self.risk_model.asset_returns.pop(sym, None)
+			self.risk_model.vix_profile.asset_vix_beta.pop(sym, None)
